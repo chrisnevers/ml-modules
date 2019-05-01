@@ -1,6 +1,6 @@
 
 open OUnit
-open Main
+open Modules
 
 let example_test = fun () ->
     assert_equal true true
