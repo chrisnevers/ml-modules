@@ -133,7 +133,7 @@ module type ModuleSyntax = sig
     (* mod1(mod2) *)
     | Apply of mod_term * mod_term
     (* (mod : mty) *)
-    | Constraint of mod_term * mod_term
+    | Constraint of mod_term * mod_type
 
   and structure = definition list
 
@@ -341,3 +341,197 @@ module type ModuleTyping = sig
 end
 
 
+module Module_Typing
+  (TheMod : ModuleSyntax)
+  (TheEnv : EnvSig with module Mod = TheMod)
+  (CT : CoreTyping with module Core = TheMod.Core and module Env = TheEnv)
+= struct
+
+  module Mod = TheMod
+
+  module Env = TheEnv
+
+  open Mod
+
+  (*
+    A module type M matches a module type N if any module m satisfying the
+    specification M, also satisfies N.
+  *)
+  let rec modtype_match env mty1 mty2 =
+    match mty1, mty2 with
+    (*
+      M may specify more components than N. Components common to both sigs
+      may be specified more tightly in M than in N.
+    *)
+    | Signature sig1, Signature sig2 ->
+      let paired_components, subst = pair_signature_components sig1 sig2 in
+      let ext_env = Env.add_signature sig1 env in
+      List.iter (specification_match ext_env subst) paired_components
+    (*
+      M's result type can be more precise than N's, or M's argument type
+      can be less precise (accepting more arguments) than N's.
+    *)
+    | FunctorType (param1, arg1, res1), FunctorType (param2, arg2, res2) ->
+      let subst = Subst.add param1 (PIdent param2) Subst.identity in
+      let res1' = Mod.subst_modtype res1 subst in
+      modtype_match env arg2 arg1;
+      modtype_match (Env.add_module param2 arg2 env) res1' res2
+    | _, _ -> error "module type mismatch"
+
+  and pair_signature_components sig1 sig2 =
+    match sig2 with
+    | [] -> [], Subst.identity
+    | item2 :: tl2 ->
+      (* Associate the component of sig1 with same name and class to sig2 *)
+      let rec find_matching_component = function
+        | [] -> error "unmatched signature component"
+        | item1 :: tl1 ->
+          match item1, item2 with
+          | ValueSig (id1, _), ValueSig (id2, _)
+            when Ident.name id1 = Ident.name id2 ->
+            id1, id2, item1
+          | TypeSig (id1, _), TypeSig (id2, _)
+            when Ident.name id1 = Ident.name id2 ->
+            id1, id2, item1
+          | ModuleSig (id1, _), ModuleSig (id2, _)
+            when Ident.name id1 = Ident.name id2 ->
+            id1, id2, item1
+          | _ -> find_matching_component tl1 in
+      let id1, id2, item1 = find_matching_component sig1 in
+      let pairs, subst = pair_signature_components sig1 tl2 in
+      (* Build substitution that equates identifiers *)
+      (item1, item2) :: pairs, Subst.add id2 (PIdent id1) subst
+
+  and specification_match env subst = function
+    | ValueSig (_, vty1), ValueSig (_, vty2) ->
+      if not (CT.valtype_match env vty1 (Core.subst_valtype vty2 subst))
+      then error "value components do not match"
+    | TypeSig (id, decl1), TypeSig (_, decl2) ->
+      if not (typedecl_match env id decl1 (Mod.subst_typedecl decl2 subst))
+      then error "type components do not match"
+    | ModuleSig (_, mty1), ModuleSig (_, mty2) ->
+      modtype_match env mty1 (Mod.subst_modtype mty2 subst)
+
+  and typedecl_match env id decl1 decl2 =
+    CT.kind_match env decl1.kind decl2.kind &&
+    begin match decl1.manifest, decl2.manifest with
+    | _, None -> true
+    | Some typ1, Some typ2 -> CT.deftype_equiv env decl2.kind typ1 typ2
+    | None, Some typ2 -> CT.deftype_equiv env decl2.kind
+                          (CT.deftype_of_path (PIdent id) decl1.kind) typ2
+    end
+
+  (*
+    Replace all abstract type specifications by the corresponding manifest
+    types rooted at the given path.
+  *)
+  let rec strengthen_modtype path mty =
+    match mty with
+    | Signature sg -> Signature (List.map (strengthen_spec path) sg)
+    | FunctorType _ -> mty
+
+  and strengthen_spec path item =
+    match item with
+    | ValueSig (id, vty) -> item
+    | TypeSig (id, decl) ->
+      let m = match decl.manifest with
+        | None -> Some (CT.deftype_of_path
+          (PDot (path, Ident.name id)) decl.kind)
+        | Some ty -> Some ty
+      in
+      TypeSig (id, { kind = decl.kind; manifest = m })
+    | ModuleSig (id, mty) ->
+      ModuleSig (id, strengthen_modtype (PDot (path, Ident.name id)) mty)
+
+  (*
+    Checks the well-formedness of a user supplied module type.
+    Particularly, that no variable is used before being bound.
+  *)
+  let rec check_modtype env = function
+    | Signature sg -> check_signature env [] sg
+    | FunctorType (param, arg, res) ->
+      check_modtype env arg;
+      check_modtype (Env.add_module param arg env) res
+
+  and check_signature env seen = function
+    | [] -> ()
+    | ValueSig (id, vty) :: tl ->
+      if List.mem (Ident.name id) seen
+      then error "repeated value name";
+      CT.check_valtype env vty;
+      check_signature env (Ident.name id :: seen) tl
+    | TypeSig (id, decl) :: tl ->
+      if List.mem (Ident.name id) seen
+      then error "repeated type name";
+      CT.check_kind env decl.kind;
+      begin match decl.manifest with
+      | None -> ()
+      | Some typ ->
+        if not (CT.kind_match env (CT.kind_deftype env typ) decl.kind)
+        then error "kind mismatch in manifest type specification";
+      end;
+      check_signature (Env.add_type id decl env) (Ident.name id :: seen) tl
+    | ModuleSig (id, mty) :: tl ->
+      if List.mem (Ident.name id) seen
+      then error "repeated module name";
+      check_modtype env mty;
+      check_signature (Env.add_module id mty env) (Ident.name id :: seen) tl
+
+  let rec type_module env = function
+    (*
+      Reference to module identifier or module component is typed by
+      a lookup in env. Then it's strengthened, which turns abstract type
+      specifications of manifestly equal types to themselves. Strengthening
+      ensures that the identities of abstract types are preserved.
+    *)
+    | LongIdent path -> strengthen_modtype path (Env.find_module path env)
+    (* Type each definiton then add to env before typing rest. *)
+    | Structure str -> Signature (type_structure env [] str)
+    (* Type param, then add it to env and process body. *)
+    | Functor (param, mty, body) ->
+      check_modtype env mty;
+      FunctorType (param, mty, type_module (Env.add_module param mty env) body)
+    (*
+      Type functor and its argument. Then check that the argument matches
+      the parameter type. I.E. the argument must provide at least all the
+      components required by the functor, with types at least as general.
+    *)
+    | Apply (funct, (LongIdent path as arg)) ->
+      begin match type_module env funct with
+      | FunctorType (param, mty_param, mty_res) ->
+        let mty_arg = type_module env arg in
+        modtype_match env mty_arg mty_param;
+        subst_modtype mty_res (Subst.add param path Subst.identity)
+      | _ -> error "application of a non-functor"
+      end
+    | Apply (funct, arg) -> error "application of a functor to a non-path"
+    | Constraint (modl, mty) ->
+      check_modtype env mty;
+      modtype_match env (type_module env modl) mty;
+      mty
+
+    and type_structure env seen = function
+      | [] -> []
+      | stritem :: tl ->
+        let (sigitem, seen') = type_definition env seen stritem in
+        sigitem :: type_structure (Env.add_spec sigitem env) seen' tl
+
+    and type_definition env seen = function
+      | ValueStr (id, term) ->
+        if List.mem (Ident.name id) seen
+        then error "repeated value name";
+        (ValueSig (id, CT.type_term env term), Ident.name id :: seen)
+      | ModuleStr (id, modl) ->
+        if List.mem (Ident.name id) seen
+        then error "repeated module name";
+        (ModuleSig (id, type_module env modl), Ident.name id :: seen)
+      | TypeStr (id, kind, typ) ->
+        if List.mem (Ident.name id) seen
+        then error "repeated type name";
+        CT.check_kind env kind;
+        if not (CT.kind_match env (CT.kind_deftype env typ) kind)
+        then error "kind mismatch in type definition";
+        (TypeSig (id, { kind = kind; manifest = Some typ }),
+          Ident.name id :: seen)
+
+end
